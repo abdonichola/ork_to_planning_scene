@@ -20,7 +20,8 @@ namespace ork_to_planning_scene
 {
 
 OrkToPlanningScene::OrkToPlanningScene() :
-    actionOrk_("recognize_objects", true),
+  actionOrk_("recognize_objects", true),
+    actionSimtrackDetection_("simtrack_to_planning_scene", true),
     actionOrkToPlanningScene_(ros::NodeHandle(), "ork_to_planning_scene",
             boost::bind(&OrkToPlanningScene::orkToPlanningSceneCallback, this, _1), false)
 {
@@ -116,6 +117,46 @@ void OrkToPlanningScene::orkToPlanningSceneCallback(
         if(!updateOK) {
             ROS_ERROR("processObjectRecognition failed - probably due to planning scene update not verified or moveit not running.");
             actionOrkToPlanningScene_.setAborted();
+        }
+        // Nichola: Process Simtrack first.
+        // else {
+        //    actionOrkToPlanningScene_.setSucceeded(result);
+        // }
+    } else {
+        ROS_ERROR("ObjectRecognition Action timed out.");
+        actionOrkToPlanningScene_.setAborted();
+    }
+
+
+    // Call the Simatrack detection action.
+    ROS_INFO("Sending SimtrackToPlanningScene request.");
+    object_recognition_msgs::ObjectRecognitionGoal simtrackGoal;
+    simtrackGoal.use_roi = false;
+    actionSimtrackDetection_.sendGoal(simtrackGoal);
+
+    finished_before_timeout = 
+      actionSimtrackDetection_.waitForResult(ros::Duration(300.0));
+    if(finished_before_timeout) {
+        actionlib::SimpleClientGoalState state = 
+          actionSimtrackDetection_.getState();
+        ROS_INFO("Simtrack Action finished: %s", state.toString().c_str());
+        if(state != actionlib::SimpleClientGoalState::SUCCEEDED) {
+            ROS_ERROR("Simtrack action failed.");
+            actionOrkToPlanningScene_.setAborted();
+            return;
+        }
+        std::string table_prefix = goal->table_prefix;
+        if(table_prefix.empty())
+            table_prefix = "table";
+
+        ork_to_planning_scene_msgs::UpdatePlanningSceneFromOrkResult result;
+        bool updateOK =
+          processObjectRecognition(actionSimtrackDetection_.getResult(),
+                goal->expected_objects, goal->verify_planning_scene_update,
+                goal->add_tables, table_prefix, goal->merge_tables, result);
+        if(!updateOK) {
+            ROS_ERROR("processObjectRecognition failed - probably due to planning scene update not verified or moveit not running.");
+            actionOrkToPlanningScene_.setAborted();
         } else {
             actionOrkToPlanningScene_.setSucceeded(result);
         }
@@ -123,6 +164,7 @@ void OrkToPlanningScene::orkToPlanningSceneCallback(
         ROS_ERROR("ObjectRecognition Action did not finish before the time out.");
         actionOrkToPlanningScene_.setAborted();
     }
+
 }
 
 class NotInSet {
@@ -625,7 +667,57 @@ double OrkToPlanningScene::estimateContourMeanZ(const std::vector<geometry_msgs:
     return sumZ;
 }
 
+// Modified by Nichola to get meshes directly from simtrack_to_planning_scene   
+//  action result.
 bool OrkToPlanningScene::collisionObjectFromRecognizedObject(const object_recognition_msgs::RecognizedObject & ro,
+        moveit_msgs::CollisionObject & co, const std::string & table_prefix)
+{
+    co.header = ro.header;
+    co.type = ro.type;
+
+    double z_offset = 0.0;
+    if(isTable(co.type)) {  // this is a table, not a RecognizedObject
+        if(!isValidTable(ro)) {
+            return false;
+        }
+        double contourMeanZ = estimateContourMeanZ(ro.bounding_contours);
+        z_offset = contourMeanZ;    // we push the mesh against that, correct the pose by this
+        co.meshes.push_back(createMeshFromCountour(ro.bounding_contours, -contourMeanZ));
+        if(co.meshes.front().triangles.empty()) {
+            ROS_WARN("Detected table had no triangles.");
+            return false;
+        }
+        co.id = table_prefix;
+    } else {
+      // Assume this is a simtrack object, i.e., already has a mesh.
+        ROS_WARN_STREAM(__func__ << ": Treating as simtrack object.");
+        if(ro.bounding_mesh.triangles.empty()){
+            ROS_ERROR("Object is not a table and also has no mesh.");
+            return false;
+        }
+        co.meshes.push_back(ro.bounding_mesh);
+        co.id = ro.type.key;
+    }
+
+    // we now have a mesh from somewhere
+    // apply z_offset to pose
+    tf::Pose mesh_pose;
+    tf::poseMsgToTF(ro.pose.pose.pose, mesh_pose);
+    tf::Pose z_offset_pose(tf::Quaternion(0,0,0,1), tf::Vector3(0.0, 0.0, z_offset));
+    mesh_pose *= z_offset_pose;
+
+    // TODO what with the merging
+    geometry_msgs::Pose offset_mesh_pose;
+    tf::poseTFToMsg(mesh_pose, offset_mesh_pose);
+    co.mesh_poses.push_back(offset_mesh_pose);
+
+    return true;
+}
+
+// Original method by Christian.
+/*
+bool OrkToPlanningScene::collisionObjectFromRecognizedObject(const 
+object_recognition_msgs::RecognizedObject & ro,
         moveit_msgs::CollisionObject & co, const std::string & table_prefix)
 {
     co.header = ro.header;
@@ -693,7 +785,7 @@ bool OrkToPlanningScene::collisionObjectFromRecognizedObject(const object_recogn
 
     return true;
 }
-
+*/
 
 void OrkToPlanningScene::determineObjectMatches(
         const std::vector<moveit_msgs::CollisionObject> & planningSceneObjects,

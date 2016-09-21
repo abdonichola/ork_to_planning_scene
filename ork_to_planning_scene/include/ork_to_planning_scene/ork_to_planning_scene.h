@@ -170,8 +170,12 @@ namespace ork_to_planning_scene
         protected:
             // ROS Interface
             tf::TransformListener* tf_;
-
+            
+            // Ork recognition.
             actionlib::SimpleActionClient<object_recognition_msgs::ObjectRecognitionAction>  actionOrk_;
+            // simtrack_to_planning_scene detection.
+            actionlib::SimpleActionClient<object_recognition_msgs::ObjectRecognitionAction>
+                    actionSimtrackDetection_;
             ros::ServiceClient srvObjectInfo_;
             ros::ServiceClient srvPlanningScene_;
             ros::Publisher pubPlanningScene_;
